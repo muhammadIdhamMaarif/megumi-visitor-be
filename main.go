@@ -3,141 +3,274 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/joho/godotenv"
 )
 
-type Visitor struct {
+type Handler struct {
+	db *sql.DB
+}
+
+// Request payloads
+type VisitorRequest struct {
 	Nama         string `json:"nama"`
 	Instansi     string `json:"instansi"`
 	Kontak       string `json:"kontak"`
-	PicLab       string `json:"picLab"`
+	PICLab       string `json:"pic_lab"`
 	Tujuan       string `json:"tujuan"`
-	TujuanCustom string `json:"tujuanCustom"`
-	CreatedAt    string `json:"createdAt,omitempty"`
+	TujuanCustom string `json:"tujuan_custom"`
 }
 
-var db *sql.DB
+type UserRequest struct {
+	Nama   string `json:"nama"`
+	NIM    string `json:"nim"`
+	Kontak string `json:"kontak"`
+}
+
+type ManagerRequest struct {
+	Nama string `json:"nama"`
+}
+
+// Generic response
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
 
 func main() {
-	// Example DSN:
-	//   user:password@tcp(127.0.0.1:3306)/lab_mgm?parseTime=true
-	// Set this in GoLand Run Configuration or your shell.
-	dsn := os.Getenv("DATABASE_DSN")
-	if dsn == "" {
-		log.Fatal("DATABASE_DSN environment variable is not set")
-	}
+	// Load .env (ignore error if file not present, env may come from Docker, etc.)
+	_ = godotenv.Load()
 
-	var err error
-	db, err = sql.Open("mysql", dsn)
+	db, err := initDB()
 	if err != nil {
-		log.Fatalf("error opening DB: %v", err)
+		log.Fatalf("failed to connect to database: %v", err)
 	}
+	defer db.Close()
 
-	if err = db.Ping(); err != nil {
-		log.Fatalf("error pinging DB: %v", err)
-	}
-	log.Println("Connected to MySQL successfully")
+	handler := &Handler{db: db}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/visitors", visitorsHandler)
+	mux.HandleFunc("/api/v1/visitor-form", handler.CreateVisitor)
+	mux.HandleFunc("/api/v1/user-form", handler.CreateUser)
+	mux.HandleFunc("/api/v1/manager-form", handler.CreateManager)
 
-	// Wrap with CORS middleware
-	handler := withCORS(mux)
+	port := os.Getenv("SERVER_PORT")
+	if port == "" {
+		port = "8080"
+	}
 
-	addr := ":8080"
-	log.Printf("Server running on %s ...", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	addr := ":" + port
+	log.Printf("Server is running on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-// CORS middleware: adjust origin to your frontend URL
-func withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Change this to your actual frontend origin if needed
-		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+func initDB() (*sql.DB, error) {
+	host := os.Getenv("DB_HOST")
+	port := os.Getenv("DB_PORT")
+	user := os.Getenv("DB_USER")
+	pass := os.Getenv("DB_PASSWORD")
+	name := os.Getenv("DB_NAME")
 
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+	if host == "" || port == "" || user == "" || name == "" {
+		return nil, fmt.Errorf("database configuration is incomplete; check .env")
+	}
 
-		next.ServeHTTP(w, r)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local",
+		user, pass, host, port, name)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	// Optional tuning
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+// Helpers
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	writeJSON(w, http.StatusMethodNotAllowed, APIResponse{
+		Success: false,
+		Message: "method not allowed",
 	})
 }
 
-func visitorsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		handleCreateVisitor(w, r)
+// Handlers
+
+// POST /api/v1/visitor-form
+func (h *Handler) CreateVisitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
 		return
 	}
 
-	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-}
-
-func handleCreateVisitor(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-
-	var v Visitor
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+	var req VisitorRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "invalid JSON body",
+		})
 		return
 	}
 
-	// Basic validation
-	if v.Nama == "" || v.Instansi == "" || v.Kontak == "" || v.PicLab == "" || v.Tujuan == "" {
-		http.Error(w, "missing required fields", http.StatusBadRequest)
+	// Simple validation (you can expand this as needed)
+	if req.Nama == "" || req.Instansi == "" || req.Kontak == "" || req.PICLab == "" || req.Tujuan == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "missing required fields",
+		})
 		return
 	}
 
-	if v.Tujuan == "lainnya" && v.TujuanCustom == "" {
-		http.Error(w, "tujuanCustom is required when tujuan is 'lainnya'", http.StatusBadRequest)
-		return
+	var tujuanCustom interface{}
+	if req.TujuanCustom == "" {
+		tujuanCustom = nil // will be stored as NULL
+	} else {
+		tujuanCustom = req.TujuanCustom
 	}
 
-	query := `
-		INSERT INTO visitors (nama, instansi, kontak, pic_lab, tujuan, tujuan_custom, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`
-
-	now := time.Now()
-
-	_, err := db.Exec(
-		query,
-		v.Nama,
-		v.Instansi,
-		v.Kontak,
-		v.PicLab,
-		v.Tujuan,
-		nullIfEmpty(v.TujuanCustom),
-		now,
+	res, err := h.db.Exec(
+		`INSERT INTO visitors (nama, instansi, kontak, pic_lab, tujuan, tujuan_custom)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		req.Nama, req.Instansi, req.Kontak, req.PICLab, req.Tujuan, tujuanCustom,
 	)
 	if err != nil {
 		log.Printf("error inserting visitor: %v", err)
-		http.Error(w, "failed to save data", http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: "failed to save visitor data",
+		})
 		return
 	}
 
-	v.CreatedAt = now.Format(time.RFC3339)
+	id, _ := res.LastInsertId()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]any{
-		"message": "visitor saved",
-		"data":    v,
+	writeJSON(w, http.StatusCreated, APIResponse{
+		Success: true,
+		Message: "visitor data saved",
+		Data: map[string]interface{}{
+			"id": id,
+		},
 	})
 }
 
-func nullIfEmpty(s string) *string {
-	if s == "" {
-		return nil
+// POST /api/v1/user-form
+func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
 	}
-	return &s
+
+	var req UserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "invalid JSON body",
+		})
+		return
+	}
+
+	if req.Nama == "" || req.NIM == "" || req.Kontak == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "missing required fields",
+		})
+		return
+	}
+
+	res, err := h.db.Exec(
+		`INSERT INTO users (nama, nim, kontak)
+		 VALUES (?, ?, ?)`,
+		req.Nama, req.NIM, req.Kontak,
+	)
+	if err != nil {
+		log.Printf("error inserting user: %v", err)
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: "failed to save user data",
+		})
+		return
+	}
+
+	id, _ := res.LastInsertId()
+
+	writeJSON(w, http.StatusCreated, APIResponse{
+		Success: true,
+		Message: "user data saved",
+		Data: map[string]interface{}{
+			"id": id,
+		},
+	})
+}
+
+// POST /api/v1/manager-form
+func (h *Handler) CreateManager(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	var req ManagerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "invalid JSON body",
+		})
+		return
+	}
+
+	if req.Nama == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "missing required field: nama",
+		})
+		return
+	}
+
+	res, err := h.db.Exec(
+		`INSERT INTO managers (nama)
+		 VALUES (?)`,
+		req.Nama,
+	)
+	if err != nil {
+		log.Printf("error inserting manager: %v", err)
+		writeJSON(w, http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: "failed to save manager data",
+		})
+		return
+	}
+
+	id, _ := res.LastInsertId()
+
+	writeJSON(w, http.StatusCreated, APIResponse{
+		Success: true,
+		Message: "manager data saved",
+		Data: map[string]interface{}{
+			"id": id,
+		},
+	})
 }
